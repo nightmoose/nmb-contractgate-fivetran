@@ -73,6 +73,8 @@ ruff check .
 pytest
 ```
 
+`fivetran debug` scans every Python file, including `tests/`, and may suggest adding `pytest` to `requirements.txt`. Keep the committed file. The connector runtime has no extra packages; `requests` and `fivetran_connector_sdk` stay pre-installed. The tester can also remove a comment-only `requirements.txt`. Restore the committed copy if that happens.
+
 ## Configuration
 
 | Field | Required | Secret | Description |
