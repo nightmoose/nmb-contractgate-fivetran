@@ -1,0 +1,4 @@
+fivetran-connector-sdk==2.13.0
+pytest==9.1.1
+requests==2.34.2
+ruff==0.17.1
