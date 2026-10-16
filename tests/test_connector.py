@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from datetime import datetime, timezone
 
 import pytest
@@ -14,7 +15,7 @@ import connector
 API_KEY = "cg_test_api_key_do_not_log"
 PAYLOAD_SENTINEL = "payload-secret-do-not-log"
 CONTRACT_A = "550e8400-e29b-41d4-a716-446655440000"
-CONTRACT_B = "contract/b"
+CONTRACT_B = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 
 
 class FakeResponse:
@@ -149,10 +150,13 @@ def test_configuration_check_rejects_missing_fields():
 
 def test_configuration_check_defaults_base_url_and_schema_tables():
     normalized = connector.validate_configuration(
-        {"api_key": f"  {API_KEY}  ", "contract_ids": f"{CONTRACT_A}, {CONTRACT_A}, other"}
+        {
+            "api_key": f"  {API_KEY}  ",
+            "contract_ids": f"{CONTRACT_A}, {CONTRACT_A.upper()}, {CONTRACT_B}",
+        }
     )
     assert normalized["api_key"] == API_KEY
-    assert normalized["contract_ids"] == [CONTRACT_A, "other"]
+    assert normalized["contract_ids"] == [CONTRACT_A, CONTRACT_B]
     assert normalized["base_url"] == connector.PROD_BASE_URL
 
     staged = connector.validate_configuration(
@@ -173,12 +177,10 @@ def test_configuration_check_defaults_base_url_and_schema_tables():
             }
         )
 
-    tables = connector.schema(
-        {"api_key": API_KEY, "contract_ids": f"{CONTRACT_A},{CONTRACT_B}"}
-    )
+    tables = connector.schema({"api_key": API_KEY, "contract_ids": f"{CONTRACT_A},{CONTRACT_B}"})
     assert [table["table"] for table in tables] == [
         "passed_550e8400_e29b_41d4_a716_446655440000",
-        "passed_contract_b",
+        "passed_6ba7b810_9dad_11d1_80b4_00c04fd430c8",
     ]
     assert tables[0]["primary_key"] == ["id"]
     assert tables[0]["columns"] == {
@@ -187,9 +189,7 @@ def test_configuration_check_defaults_base_url_and_schema_tables():
         "created_at": "UTC_DATETIME",
         "payload": "JSON",
     }
-    assert connector.configuration_check(
-        {"api_key": API_KEY, "contract_ids": CONTRACT_A}
-    ).success
+    assert connector.configuration_check({"api_key": API_KEY, "contract_ids": CONTRACT_A}).success
 
 
 def test_paging_checkpoints_each_page_and_keeps_non_null_final_cursor(
@@ -285,13 +285,20 @@ def test_null_payload_is_upserted_as_null(monkeypatch, logs, ops):
     assert_no_secrets(logs, checkpoints)
 
 
-@pytest.mark.parametrize("status", [400, 410])
-def test_rejected_cursor_clears_state_and_resyncs(monkeypatch, logs, ops, status):
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [
+        (410, "cursor expired"),
+        (400, "invalid cursor"),
+        (400, "The passed-event cursor is Invalid Cursor"),
+    ],
+)
+def test_expired_or_invalid_cursor_clears_state_and_resyncs(monkeypatch, logs, ops, status, error):
     upserts, checkpoints = ops
     session = install_session(
         monkeypatch,
         [
-            FakeResponse(status, {"error": "cursor rejected", "status": status}),
+            FakeResponse(status, {"error": error, "status": status}),
             page([event("evt-full", payload={"note": PAYLOAD_SENTINEL})], "fresh", False),
         ],
     )
@@ -331,7 +338,7 @@ def test_second_cursor_rejection_during_resync_fails(monkeypatch, logs, ops):
         monkeypatch,
         [
             FakeResponse(410, {"error": "gone", "status": 410}),
-            FakeResponse(400, {"error": "bad", "status": 400}),
+            FakeResponse(410, {"error": "gone", "status": 410}),
         ],
     )
 
@@ -341,6 +348,117 @@ def test_second_cursor_rejection_during_resync_fails(monkeypatch, logs, ops):
     assert len(session.calls) == 2
     assert checkpoints[0]["cursors"] == {}
     assert_no_secrets(logs, checkpoints)
+
+
+def test_other_400_fails_with_api_error_and_keeps_state(monkeypatch, logs, ops):
+    upserts, checkpoints = ops
+    session = install_session(
+        monkeypatch,
+        [FakeResponse(400, {"error": "limit must be at least 1", "status": 400})],
+    )
+
+    with pytest.raises(connector.ContractGateSyncError, match="limit must be at least 1") as raised:
+        connector.update(config(), {"cursors": {CONTRACT_A: "keep-me", CONTRACT_B: "leave-b"}})
+
+    assert "keep-me" not in str(raised.value)
+    assert API_KEY not in str(raised.value)
+    assert len(session.calls) == 1
+    assert session.calls[0]["params"]["cursor"] == "keep-me"
+    assert upserts == []
+    assert checkpoints == []
+    assert_no_secrets(logs, checkpoints)
+
+
+def test_other_400_after_a_page_keeps_the_saved_cursor(monkeypatch, logs, ops):
+    upserts, checkpoints = ops
+    session = install_session(
+        monkeypatch,
+        [
+            page([event("evt-1")], "cursor-1", True),
+            FakeResponse(400, {"error": "limit must be at least 1", "status": 400}),
+        ],
+    )
+
+    with pytest.raises(connector.ContractGateSyncError, match="limit must be at least 1"):
+        connector.update(config(), {"cursors": {CONTRACT_B: "leave-b"}})
+
+    assert len(session.calls) == 2
+    assert upserts[0][1]["id"] == "evt-1"
+    assert checkpoints == [{"cursors": {CONTRACT_B: "leave-b", CONTRACT_A: "cursor-1"}}]
+    assert_no_secrets(logs, checkpoints)
+
+
+def test_one_page_incremental_resume_upserts_no_old_rows(monkeypatch, logs, ops):
+    upserts, checkpoints = ops
+    session = install_session(
+        monkeypatch,
+        [
+            page(
+                [event("evt-1"), event("evt-2", created_at="2026-05-01T12:00:01Z")],
+                "cursor-2",
+                False,
+            ),
+            page(
+                [
+                    event("evt-3", created_at="2026-05-01T12:00:02Z"),
+                    event("evt-4", created_at="2026-05-01T12:00:03Z"),
+                ],
+                "cursor-4",
+                False,
+            ),
+        ],
+    )
+
+    connector.update(config(), {})
+    assert [row[1]["id"] for row in upserts] == ["evt-1", "evt-2"]
+    assert checkpoints[-1]["cursors"][CONTRACT_A] == "cursor-2"
+
+    upserts.clear()
+    connector.update(config(), checkpoints[-1])
+
+    resumed = [row[1]["id"] for row in upserts]
+    assert resumed == ["evt-3", "evt-4"]
+    assert "evt-1" not in resumed
+    assert "evt-2" not in resumed
+    assert session.calls[1]["params"]["cursor"] == "cursor-2"
+    assert len(session.calls) == 2
+    assert checkpoints[-1]["cursors"][CONTRACT_A] == "cursor-4"
+    assert_no_secrets(logs, checkpoints)
+
+
+def test_multi_page_resume(monkeypatch, logs, ops):
+    upserts, checkpoints = ops
+    session = install_session(
+        monkeypatch,
+        [
+            page([event("evt-2")], "cursor-2", True),
+            page([event("evt-3", created_at="2026-05-01T12:00:02Z")], "cursor-3", False),
+        ],
+    )
+
+    connector.update(config(), {"cursors": {CONTRACT_A: "cursor-1", CONTRACT_B: "leave-b"}})
+
+    assert [call["params"]["cursor"] for call in session.calls] == ["cursor-1", "cursor-2"]
+    assert [row[1]["id"] for row in upserts] == ["evt-2", "evt-3"]
+    assert checkpoints[-1]["cursors"] == {CONTRACT_B: "leave-b", CONTRACT_A: "cursor-3"}
+    assert_no_secrets(logs, checkpoints)
+
+
+def test_bad_uuid_fails_and_names_the_id(monkeypatch, ops):
+    bad = "contract/b"
+    checked = connector.configuration_check(
+        {"api_key": API_KEY, "contract_ids": f"{CONTRACT_A},{bad}"}
+    )
+    assert bad in checked.failure
+    assert "UUID" in checked.failure
+
+    with pytest.raises(ValueError, match=re.escape(bad)):
+        connector.schema({"api_key": API_KEY, "contract_ids": bad})
+
+    session = install_session(monkeypatch, [page([event("evt-1")], "cursor-1", False)])
+    with pytest.raises(ValueError, match=re.escape(bad)):
+        connector.update(config(contract_ids=bad), {})
+    assert session.calls == []
 
 
 def test_free_plan_403_fails_with_paid_plan_required(monkeypatch, logs, ops):
@@ -424,12 +542,3 @@ def test_retries_exhausted_do_not_include_secrets(monkeypatch, logs, ops, sleeps
     assert len(sleeps) == 4
     assert checkpoints == []
     assert_no_secrets(logs, checkpoints)
-
-
-def test_slash_in_contract_id_is_escaped(monkeypatch, ops, logs):
-    _upserts, _checkpoints = ops
-    session = install_session(monkeypatch, [page([event("evt-1")], "c", False)])
-
-    connector.update(config(contract_ids=CONTRACT_B), {})
-
-    assert session.calls[0]["url"].endswith("/v1/contracts/contract%2Fb/passed")

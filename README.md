@@ -40,10 +40,15 @@ Run the command from the directory that contains `connector.py`. The connection 
 `fivetran debug` runs the connector on your machine and writes a local DuckDB file.
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install fivetran-connector-sdk
-# Edit configuration.json with your API key, contract ids, and base URL.
+# Edit configuration.json with your API key, contract UUIDs, and base URL.
+# Activation puts .venv/bin on PATH. fivetran debug runs pipreqs from that directory.
 fivetran debug --configuration configuration.json
 ```
+
+`fivetran debug` needs the virtualenv `bin` directory on `PATH` so it can run `pipreqs`. It may rewrite `requirements.txt`. Keep the committed `requirements.txt`, and restore that copy if the command changes the file.
 
 The tester writes:
 
@@ -73,14 +78,14 @@ ruff check .
 pytest
 ```
 
-`fivetran debug` scans every Python file, including `tests/`, and may suggest adding `pytest` to `requirements.txt`. Keep the committed file. The connector runtime has no extra packages; `requests` and `fivetran_connector_sdk` stay pre-installed. The tester can also remove a comment-only `requirements.txt`. Restore the committed copy if that happens.
+The connector runtime has no extra packages. `requests` and `fivetran_connector_sdk` stay pre-installed, so leave the committed `requirements.txt` as it is. The tester scans `tests/` and may suggest adding `pytest`; that suggestion is for the test suite.
 
 ## Configuration
 
 | Field | Required | Secret | Description |
 | --- | --- | --- | --- |
 | `api_key` | yes | yes | ContractGate API key, sent as `x-api-key`. |
-| `contract_ids` | yes | no | Comma-separated contract ids. One table per id. |
+| `contract_ids` | yes | no | Comma-separated contract UUIDs. One table per id. |
 | `base_url` | no | no | API origin. Defaults to `https://api.datacontractgate.com`. |
 
 Values are strings. `schema()` and `update()` both run `validate_configuration`. The dashboard setup form registers the same rules as a setup test named **Configuration check**.
@@ -88,7 +93,7 @@ Values are strings. `schema()` and `update()` both run `validate_configuration`.
 ```json
 {
   "api_key": "",
-  "contract_ids": "contract-id-1,contract-id-2",
+  "contract_ids": "550e8400-e29b-41d4-a716-446655440000",
   "base_url": "https://api.datacontractgate.com"
 }
 ```
@@ -105,9 +110,9 @@ State is a JSON object of opaque cursors, one per contract:
 {"cursors": {"your-contract-id": "opaque-cursor"}}
 ```
 
-The connector checkpoints that object after every page. A checkpoint never stores null. On the last page the API may return either a new `next_cursor` or `next_cursor: null` with `has_more: false`. A non-null cursor is saved. A null cursor leaves the last saved cursor in place, so the next sync still has a position and does not treat the contract as a first run.
+The connector checkpoints that object after every page and stops paging when `has_more` is false. `next_cursor` is a resume cursor. On a page with events it is the cursor of the last event, including when `has_more` is false. On an empty page it repeats the cursor from the request. Every non-null `next_cursor` is saved, including on the last page. A null `next_cursor` is left out of the checkpoint, so the last saved cursor stays in place.
 
-HTTP 400 (malformed cursor) and HTTP 410 (cursor older than the plan retention window) both drop that contract's cursor and re-sync from the oldest passed record. HTTP 429 and 5xx responses are retried with backoff. Requests use a 10-second connect timeout and a 60-second read timeout.
+HTTP 410 (cursor older than the plan retention window) and HTTP 400 whose error says `invalid cursor` drop that contract's cursor and re-sync from the oldest passed record. Any other HTTP 400 fails the sync with the API's error message and leaves the saved cursor in place. HTTP 429 and 5xx responses are retried with backoff. Requests use a 10-second connect timeout and a 60-second read timeout.
 
 The API holds back rows newer than about five seconds, so the newest passed records can lag a sync by that much. Kafka and Kinesis consumers write a different path, so this export contains the HTTP and batch records that passed.
 

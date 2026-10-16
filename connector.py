@@ -28,6 +28,10 @@ REQUEST_TIMEOUT = (10, 60)
 PAID_PLAN_REQUIRED = "paid plan required"
 
 _TABLE_NAME = re.compile(r"[^a-z0-9]+")
+_CONTRACT_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 _RETRYABLE_REQUEST_ERRORS = (
     Timeout,
     ConnectionError,
@@ -54,7 +58,7 @@ class UnknownContractError(ContractGateSyncError):
 
 
 class CursorRejected(Exception):
-    """HTTP 400 or 410: the cursor cannot be used and must be dropped."""
+    """HTTP 410, or HTTP 400 whose error says the cursor is invalid."""
 
     def __init__(self, status_code: int) -> None:
         super().__init__(f"cursor rejected with HTTP {status_code}")
@@ -83,6 +87,7 @@ def validate_configuration(configuration: dict) -> dict:
         contract_id = part.strip()
         if not contract_id:
             raise ValueError("contract_ids contains an empty contract id")
+        contract_id = _require_contract_uuid(contract_id)
         if contract_id not in contract_ids:
             contract_ids.append(contract_id)
 
@@ -129,8 +134,8 @@ def configuration_form():
             "contract_ids",
             "Contract IDs",
             required=True,
-            description="Comma-separated contract ids. Each one is synced to its own table.",
-            placeholder="contract-id-1,contract-id-2",
+            description="Comma-separated contract UUIDs. Each one is synced to its own table.",
+            placeholder="550e8400-e29b-41d4-a716-446655440000",
         )
     )
     form.add_field(
@@ -184,6 +189,13 @@ def update(configuration: dict, state: dict):
             _sync_contract(session, config, sync_state, contract_id)
     finally:
         session.close()
+
+
+def _require_contract_uuid(contract_id: str) -> str:
+    """Return the lowercase UUID, or raise ValueError naming the rejected id."""
+    if _CONTRACT_UUID.fullmatch(contract_id) is None:
+        raise ValueError(f"contract id {contract_id!r} is not a UUID")
+    return contract_id.lower()
 
 
 def table_name_for(contract_id: str) -> str:
@@ -317,8 +329,9 @@ def _sync_pages(
         for event in events:
             op.upsert(table=table, data=_event_row(event))
 
-        # The last page may send next_cursor null with has_more false. Keep the
-        # cursor already saved for this contract. Never store null.
+        # next_cursor is a resume cursor: the last event on a non-empty page,
+        # or the request cursor echoed on an empty page. Save every non-null
+        # value, including on the last page. Never store null.
         next_cursor = _usable_cursor(page.get("next_cursor"))
         if next_cursor:
             _set_cursor(state, contract_id, next_cursor)
@@ -371,8 +384,13 @@ def _fetch_page(
             continue
 
         status = response.status_code
-        if status in {400, 410}:
+        if status == 410 or (status == 400 and _error_says_invalid_cursor(response)):
             raise CursorRejected(status)
+        if status == 400:
+            raise ContractGateSyncError(
+                "ContractGate rejected the passed-events request for contract "
+                f"{contract_id}: {_error_text(response, config['api_key'])}"
+            )
         if status == 403:
             raise PaidPlanRequiredError(contract_id)
         if status == 404:
@@ -410,6 +428,33 @@ def _fetch_page(
         return body
 
     raise ContractGateSyncError(f"ContractGate request failed for contract {contract_id}")
+
+
+def _response_error(response: requests.Response) -> str | None:
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    if not isinstance(error, str) or not error.strip():
+        return None
+    return error.strip()
+
+
+def _error_says_invalid_cursor(response: requests.Response) -> bool:
+    error = _response_error(response)
+    return error is not None and "invalid cursor" in error.lower()
+
+
+def _error_text(response: requests.Response, api_key: str) -> str:
+    error = _response_error(response)
+    if error is None:
+        return f"HTTP {response.status_code}"
+    if api_key:
+        error = error.replace(api_key, "[redacted]")
+    return error
 
 
 def _event_row(event: object) -> dict:
