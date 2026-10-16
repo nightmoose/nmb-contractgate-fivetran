@@ -190,6 +190,104 @@ def test_configuration_check_defaults_base_url_and_schema_tables():
         "payload": "JSON",
     }
     assert connector.configuration_check({"api_key": API_KEY, "contract_ids": CONTRACT_A}).success
+    assert connector.validate_configuration(config())["table_names"] == {}
+
+
+def test_base_url_requires_https_except_local_http(monkeypatch, ops):
+    upserts, _checkpoints = ops
+    for base_url in ("http://127.0.0.1:8765", "http://localhost:8765/", "http://LOCALHOST"):
+        normalized = connector.validate_configuration(
+            {"api_key": API_KEY, "contract_ids": CONTRACT_A, "base_url": base_url}
+        )
+        assert normalized["base_url"].startswith("http://")
+        checked = connector.configuration_check(
+            {"api_key": API_KEY, "contract_ids": CONTRACT_A, "base_url": base_url}
+        )
+        assert checked.success
+
+    rejected = connector.configuration_check(
+        {
+            "api_key": API_KEY,
+            "contract_ids": CONTRACT_A,
+            "base_url": "http://example.com",
+        }
+    )
+    assert "https://" in rejected.failure
+    assert "localhost" in rejected.failure
+    assert "127.0.0.1" in rejected.failure
+
+    for base_url in ("http://10.0.0.1", "http://127.0.0.1.example.com", "ftp://localhost"):
+        with pytest.raises(ValueError, match="https"):
+            connector.validate_configuration(
+                {"api_key": API_KEY, "contract_ids": CONTRACT_A, "base_url": base_url}
+            )
+
+    session = install_session(monkeypatch, [page([event("evt-1")], "cursor-1", False)])
+    connector.update(config(base_url="http://127.0.0.1:8765"), {})
+    assert session.calls[0]["url"].startswith("http://127.0.0.1:8765/v1/contracts/")
+    assert upserts[0][1]["id"] == "evt-1"
+
+
+def test_table_names_override_is_optional_and_used_for_upserts(monkeypatch, ops):
+    upserts, _checkpoints = ops
+    mapping = f"{CONTRACT_A}=passed_orders"
+    tables = connector.schema(
+        config(contract_ids=f"{CONTRACT_A},{CONTRACT_B}", table_names=mapping)
+    )
+    assert [table["table"] for table in tables] == [
+        "passed_orders",
+        "passed_6ba7b810_9dad_11d1_80b4_00c04fd430c8",
+    ]
+
+    install_session(monkeypatch, [page([event("evt-1")], "cursor-1", False)])
+    connector.update(config(table_names=mapping), {})
+    assert upserts[0][0] == "passed_orders"
+
+    blank = connector.validate_configuration(config(table_names="  "))
+    assert blank["table_names"] == {}
+    assert connector.table_name_for(CONTRACT_A) == "passed_550e8400_e29b_41d4_a716_446655440000"
+
+
+def test_table_names_validation_names_the_problem():
+    bad_name = connector.configuration_check(config(table_names=f"{CONTRACT_A}=Orders"))
+    assert "Orders" in bad_name.failure
+    assert "lowercase" in bad_name.failure
+
+    unknown = "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    missing = connector.configuration_check(config(table_names=f"{unknown}=passed_orders"))
+    assert unknown in missing.failure
+    assert "contract_ids" in missing.failure
+
+    not_uuid = connector.configuration_check(config(table_names="contract/b=passed_orders"))
+    assert "contract/b" in not_uuid.failure
+    assert "UUID" in not_uuid.failure
+
+    malformed = connector.configuration_check(config(table_names="not-a-pair"))
+    assert "not-a-pair" in malformed.failure
+
+    duplicate = connector.configuration_check(
+        config(table_names=f"{CONTRACT_A}=passed_a,{CONTRACT_A.upper()}=passed_b")
+    )
+    assert CONTRACT_A in duplicate.failure
+    assert "more than once" in duplicate.failure
+
+    collision = connector.configuration_check(
+        config(
+            contract_ids=f"{CONTRACT_A},{CONTRACT_B}",
+            table_names=f"{CONTRACT_A}=passed_orders,{CONTRACT_B}=passed_orders",
+        )
+    )
+    assert "passed_orders" in collision.failure
+
+    default_a = "passed_550e8400_e29b_41d4_a716_446655440000"
+    shadowed = connector.configuration_check(
+        config(
+            contract_ids=f"{CONTRACT_A},{CONTRACT_B}",
+            table_names=f"{CONTRACT_B}={default_a}",
+        )
+    )
+    assert default_a in shadowed.failure
+    assert CONTRACT_A in shadowed.failure
 
 
 def test_paging_checkpoints_each_page_and_keeps_non_null_final_cursor(

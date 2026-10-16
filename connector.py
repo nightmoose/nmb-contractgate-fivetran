@@ -28,6 +28,8 @@ REQUEST_TIMEOUT = (10, 60)
 PAID_PLAN_REQUIRED = "paid plan required"
 
 _TABLE_NAME = re.compile(r"[^a-z0-9]+")
+_CUSTOM_TABLE_NAME = re.compile(r"^[a-z_][a-z0-9_]*$")
+_LOCAL_HTTP_HOSTS = frozenset({"localhost", "127.0.0.1"})
 _CONTRACT_UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
@@ -68,7 +70,9 @@ class CursorRejected(Exception):
 def validate_configuration(configuration: dict) -> dict:
     """Return a normalized configuration or raise ValueError.
 
-    ``base_url`` defaults to production when omitted or blank. The API key is
+    ``base_url`` defaults to production when omitted or blank, and must be
+    ``https://`` except for ``http://localhost`` and ``http://127.0.0.1``.
+    ``table_names`` is an optional ``contract_id=name`` list. The API key is
     never included in the error text.
     """
     if not isinstance(configuration, dict):
@@ -99,10 +103,13 @@ def validate_configuration(configuration: dict) -> dict:
     else:
         base_url = _normalize_base_url(base_raw)
 
+    table_names = _parse_table_names(configuration.get("table_names"), contract_ids)
+
     return {
         "api_key": api_key.strip(),
         "contract_ids": contract_ids,
         "base_url": base_url,
+        "table_names": table_names,
     }
 
 
@@ -116,7 +123,7 @@ def configuration_check(configuration: dict):
 
 
 def configuration_form():
-    """Dashboard fields for the API key, contract ids, and optional base URL."""
+    """Dashboard fields for the API key, contract ids, base URL, and table names."""
     form = ConfigurationForm()
     form.add_field(
         form_field.TextField(
@@ -143,8 +150,23 @@ def configuration_form():
             "base_url",
             "API base URL",
             required=False,
-            description=f"Defaults to {PROD_BASE_URL}.",
+            description=(
+                f"Defaults to {PROD_BASE_URL}. Must be https://, except "
+                "http://localhost and http://127.0.0.1 for local tests."
+            ),
             placeholder=PROD_BASE_URL,
+        )
+    )
+    form.add_field(
+        form_field.TextField(
+            "table_names",
+            "Table names",
+            required=False,
+            description=(
+                "Optional contract_id=name pairs, comma-separated. "
+                "Omitted contracts keep passed_<id>."
+            ),
+            placeholder="550e8400-e29b-41d4-a716-446655440000=passed_orders",
         )
     )
     form.add_test(label="Configuration check", func=configuration_check)
@@ -157,7 +179,7 @@ def schema(configuration: dict):
     tables = []
     seen: dict[str, str] = {}
     for contract_id in config["contract_ids"]:
-        table = table_name_for(contract_id)
+        table = resolve_table_name(contract_id, config["table_names"])
         if table in seen:
             raise ValueError(
                 f"contract ids {seen[table]!r} and {contract_id!r} map to the same table {table}"
@@ -206,17 +228,78 @@ def table_name_for(contract_id: str) -> str:
     return f"passed_{sanitized}"
 
 
+def resolve_table_name(contract_id: str, table_names: dict[str, str]) -> str:
+    """Return a configured name, or the stable passed_<id> name when none is set."""
+    override = table_names.get(contract_id)
+    if override:
+        return override
+    return table_name_for(contract_id)
+
+
+def _parse_table_names(raw: object, contract_ids: list[str]) -> dict[str, str]:
+    """Parse ``contract_id=name`` pairs. Blank means every contract keeps passed_<id>."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        mapping: dict[str, str] = {}
+        _reject_duplicate_tables(contract_ids, mapping)
+        return mapping
+    if not isinstance(raw, str):
+        raise ValueError("table_names must be a string")
+
+    mapping = {}
+    allowed = set(contract_ids)
+    for part in raw.split(","):
+        entry = part.strip()
+        if not entry:
+            raise ValueError("table_names contains an empty entry")
+        contract_raw, separator, name_raw = entry.partition("=")
+        if not separator or not contract_raw.strip() or not name_raw.strip():
+            raise ValueError(f"table_names entry {entry!r} must be contract_id=name")
+        try:
+            contract_id = _require_contract_uuid(contract_raw.strip())
+        except ValueError as exc:
+            raise ValueError(f"table_names {exc}") from exc
+        if contract_id not in allowed:
+            raise ValueError(f"table_names contract id {contract_id} is not in contract_ids")
+        if contract_id in mapping:
+            raise ValueError(f"table_names lists contract id {contract_id} more than once")
+        name = name_raw.strip()
+        if _CUSTOM_TABLE_NAME.fullmatch(name) is None:
+            raise ValueError(
+                f"table name {name!r} must start with a letter or underscore and use only "
+                "lowercase letters, numbers, and underscores"
+            )
+        mapping[contract_id] = name
+    _reject_duplicate_tables(contract_ids, mapping)
+    return mapping
+
+
+def _reject_duplicate_tables(contract_ids: list[str], table_names: dict[str, str]) -> None:
+    seen: dict[str, str] = {}
+    for contract_id in contract_ids:
+        table = resolve_table_name(contract_id, table_names)
+        if table in seen:
+            raise ValueError(
+                f"contract ids {seen[table]!r} and {contract_id!r} map to the same table {table}"
+            )
+        seen[table] = contract_id
+
+
 def _normalize_base_url(value: str) -> str:
     candidate = value.strip()
     parsed = urlparse(candidate)
-    if parsed.scheme not in {"https", "http"} or not parsed.netloc:
-        raise ValueError("base_url must be an absolute http or https URL")
+    hostname = parsed.hostname
+    if parsed.scheme not in {"https", "http"} or not parsed.netloc or not hostname:
+        raise ValueError("base_url must be an absolute https URL")
     if parsed.username or parsed.password:
         raise ValueError("base_url must not include credentials")
     if parsed.query or parsed.fragment:
         raise ValueError("base_url must not include a query or fragment")
     if parsed.path not in {"", "/"}:
         raise ValueError("base_url must not include a path")
+    if parsed.scheme != "https" and hostname not in _LOCAL_HTTP_HOSTS:
+        raise ValueError(
+            "base_url must use https:// (http:// is allowed only for localhost and 127.0.0.1)"
+        )
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
@@ -317,7 +400,7 @@ def _sync_pages(
     contract_id: str,
     cursor: str | None,
 ) -> None:
-    table = table_name_for(contract_id)
+    table = resolve_table_name(contract_id, config["table_names"])
     seen: set[str] = set()
     while True:
         page = _fetch_page(session, config, contract_id, cursor)

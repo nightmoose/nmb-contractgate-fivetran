@@ -2,7 +2,7 @@
 
 Source connector for [ContractGate](https://github.com/nightmoose/contractgate), the shared engine behind DataContractGate and AISchemaGate. It syncs only records that passed validation.
 
-Each configured contract becomes one destination table, `passed_<sanitized contract id>`, with primary key `id` and columns `contract_version`, `created_at` (UTC), and `payload` (JSON). `payload` is null when that customer's event-body storage is off.
+Each configured contract becomes one destination table. The default name is `passed_<sanitized contract id>`, and it stays that way unless `table_names` sets `contract_id=name` for that id. The primary key is `id`. Columns are `contract_version`, `created_at` (UTC), and `payload` (JSON). `payload` is null when that customer's event-body storage is off.
 
 The connector calls `GET /v1/contracts/{id}/passed` with the `x-api-key` header. Pages are oldest first, at most 1000 events per request. Production is `https://api.datacontractgate.com`. Staging is `https://contractgate-api-staging.fly.dev`.
 
@@ -86,7 +86,8 @@ The connector runtime has no extra packages. `requests` and `fivetran_connector_
 | --- | --- | --- | --- |
 | `api_key` | yes | yes | ContractGate API key, sent as `x-api-key`. |
 | `contract_ids` | yes | no | Comma-separated contract UUIDs. One table per id. |
-| `base_url` | no | no | API origin. Defaults to `https://api.datacontractgate.com`. |
+| `base_url` | no | no | API origin. Defaults to `https://api.datacontractgate.com`. Must be `https://`. `http://localhost` and `http://127.0.0.1` (any port) are allowed for local tests. |
+| `table_names` | no | no | Optional `contract_id=name` pairs, comma-separated. A name must start with a letter or underscore and use only lowercase letters, numbers, and underscores. Unlisted contracts keep `passed_<id>`. |
 
 Values are strings. `schema()` and `update()` both run `validate_configuration`. The dashboard setup form registers the same rules as a setup test named **Configuration check**.
 
@@ -94,9 +95,12 @@ Values are strings. `schema()` and `update()` both run `validate_configuration`.
 {
   "api_key": "",
   "contract_ids": "550e8400-e29b-41d4-a716-446655440000",
-  "base_url": "https://api.datacontractgate.com"
+  "base_url": "https://api.datacontractgate.com",
+  "table_names": "550e8400-e29b-41d4-a716-446655440000=passed_orders"
 }
 ```
+
+Leave `table_names` empty to keep every default `passed_<id>` name. Two contracts cannot share a table, and a custom name cannot reuse another contract's default `passed_<id>` name. The configuration check reports the id or name that failed.
 
 ## Paid plan
 
