@@ -18,6 +18,7 @@ import requests
 from fivetran_connector_sdk import ConfigurationForm, Connector, Test, form_field
 from fivetran_connector_sdk import Logging as log
 from fivetran_connector_sdk import Operations as op
+from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
 
 PROD_BASE_URL = "https://api.datacontractgate.com"
 PAGE_LIMIT = 1000
@@ -28,9 +29,9 @@ PAID_PLAN_REQUIRED = "paid plan required"
 
 _TABLE_NAME = re.compile(r"[^a-z0-9]+")
 _RETRYABLE_REQUEST_ERRORS = (
-    requests.Timeout,
-    requests.ConnectionError,
-    requests.ChunkedEncodingError,
+    Timeout,
+    ConnectionError,
+    ChunkedEncodingError,
 )
 
 
