@@ -1,6 +1,6 @@
-# ContractGate Fivetran connector
+# DataContractGate Fivetran connector
 
-Source connector for [ContractGate](https://github.com/nightmoose/contractgate), the shared engine behind DataContractGate and AISchemaGate. It syncs only records that passed validation.
+Source connector for DataContractGate, which shares an engine with AISchemaGate ([nightmoose/contractgate](https://github.com/nightmoose/contractgate)). It syncs only records that passed validation.
 
 Each configured contract becomes one destination table. The default name is `passed_<sanitized contract id>`, and it stays that way unless `table_names` sets `contract_id=name` for that id. The primary key is `id`. Columns are `contract_version`, `created_at` (UTC), and `payload` (JSON). `payload` is null when that customer's event-body storage is off.
 
@@ -10,7 +10,7 @@ This repository is public. `configuration.json` is committed with empty secrets.
 
 ## Deploy into your own Fivetran account
 
-A customer installs this connector in their own Fivetran account with the Connector SDK CLI. A one-click **Connect Fivetran** button inside ContractGate is coming; it is not available yet.
+A customer installs this connector in their own Fivetran account with the Connector SDK CLI. A one-click **Connect Fivetran** button inside DataContractGate is coming; it is not available yet.
 
 From this directory, with Python 3.10–3.14:
 
@@ -20,7 +20,7 @@ source .venv/bin/activate
 pip install fivetran-connector-sdk
 ```
 
-Fill `configuration.json` (see below), then deploy. `FIVETRAN_API_KEY` is the Base64 encoding of `{api_key}:{api_secret}` from your Fivetran account, not the ContractGate key.
+Fill `configuration.json` (see below), then deploy. `FIVETRAN_API_KEY` is the Base64 encoding of `{api_key}:{api_secret}` from your Fivetran account, not the DataContractGate key.
 
 ```bash
 fivetran deploy \
@@ -84,7 +84,7 @@ The connector runtime has no extra packages. `requests` and `fivetran_connector_
 
 | Field | Required | Secret | Description |
 | --- | --- | --- | --- |
-| `api_key` | yes | yes | ContractGate API key, sent as `x-api-key`. |
+| `api_key` | yes | yes | DataContractGate API key, sent as `x-api-key`. |
 | `contract_ids` | yes | no | Comma-separated contract UUIDs. One table per id. |
 | `base_url` | no | no | API origin. Defaults to `https://api.datacontractgate.com`. Must be `https://`. `http://localhost` and `http://127.0.0.1` (any port) are allowed for local tests. |
 | `table_names` | no | no | Optional `contract_id=name` pairs, comma-separated. A name must start with a letter or underscore and use only lowercase letters, numbers, and underscores. Unlisted contracts keep `passed_<id>`. |
