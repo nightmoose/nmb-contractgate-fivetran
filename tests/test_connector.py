@@ -1,4 +1,4 @@
-"""Mocked HTTP tests for the ContractGate passed-events connector."""
+"""Mocked HTTP tests for the DataContractGate passed-events connector."""
 
 from __future__ import annotations
 
@@ -95,7 +95,7 @@ def config(**overrides):
     base = {
         "api_key": API_KEY,
         "contract_ids": CONTRACT_A,
-        "base_url": "https://contractgate-api-staging.fly.dev",
+        "base_url": "https://staging.example.com",
     }
     base.update(overrides)
     return base
@@ -163,10 +163,10 @@ def test_configuration_check_defaults_base_url_and_schema_tables():
         {
             "api_key": API_KEY,
             "contract_ids": CONTRACT_A,
-            "base_url": "https://contractgate-api-staging.fly.dev/",
+            "base_url": "https://staging.example.com/",
         }
     )
-    assert staged["base_url"] == "https://contractgate-api-staging.fly.dev"
+    assert staged["base_url"] == "https://staging.example.com"
 
     with pytest.raises(ValueError, match="must not include credentials"):
         connector.validate_configuration(

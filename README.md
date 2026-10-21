@@ -4,7 +4,7 @@ Source connector for DataContractGate, which shares an engine with AISchemaGate 
 
 Each configured contract becomes one destination table. The default name is `passed_<sanitized contract id>`, and it stays that way unless `table_names` sets `contract_id=name` for that id. The primary key is `id`. Columns are `contract_version`, `created_at` (UTC), and `payload` (JSON). `payload` is null when that customer's event-body storage is off.
 
-The connector calls `GET /v1/contracts/{id}/passed` with the `x-api-key` header. Pages are oldest first, at most 1000 events per request. Production is `https://api.datacontractgate.com`. Staging is `https://contractgate-api-staging.fly.dev`.
+The connector calls `GET /v1/contracts/{id}/passed` with the `x-api-key` header. Pages are oldest first, at most 1000 events per request. Production is `https://api.datacontractgate.com`. To point at another environment, set `base_url` in `configuration.json` (see below).
 
 This repository is public. `configuration.json` is committed with empty secrets. Put a real API key only in your local file or in Fivetran, and do not commit it.
 
