@@ -7,6 +7,7 @@ and upserts one table per contract.
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import re
@@ -72,8 +73,9 @@ def validate_configuration(configuration: dict) -> dict:
 
     ``base_url`` defaults to production when omitted or blank, and must be
     ``https://`` except for ``http://localhost`` and ``http://127.0.0.1``.
-    ``table_names`` is an optional ``contract_id=name`` list. The API key is
-    never included in the error text.
+    ``contract_ids`` is a comma-separated list of UUIDs, checked before any
+    request. ``table_names`` is an optional ``contract_id=name`` list. The API
+    key is never included in the error text.
     """
     if not isinstance(configuration, dict):
         raise ValueError("configuration must be a JSON object")
@@ -91,7 +93,10 @@ def validate_configuration(configuration: dict) -> dict:
         contract_id = part.strip()
         if not contract_id:
             raise ValueError("contract_ids contains an empty contract id")
-        contract_id = _require_contract_uuid(contract_id)
+        try:
+            contract_id = _require_contract_uuid(contract_id)
+        except ValueError as exc:
+            raise ValueError(f"contract_ids configuration error: {exc}") from exc
         if contract_id not in contract_ids:
             contract_ids.append(contract_id)
 
@@ -328,6 +333,35 @@ def _usable_cursor(value: object) -> str | None:
     return None
 
 
+def _utc_timestamp_micros(value: datetime) -> int:
+    """Microseconds since the Unix epoch, matching the passed-events cursor."""
+    utc = value.astimezone(timezone.utc)
+    delta = utc - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _cursor_from_event(event: object) -> str | None:
+    """Resume cursor for one passed event.
+
+    The API's opaque cursor is unpadded base64url of
+    ``{created_at microseconds},{id}``. A page that omits ``next_cursor`` still
+    has that high-water mark on its last event. Ids that are not UUIDs are
+    skipped so the connector does not store a cursor the API would reject.
+    """
+    if not isinstance(event, dict):
+        return None
+    event_id = event.get("id")
+    if not isinstance(event_id, str) or _CONTRACT_UUID.fullmatch(event_id) is None:
+        return None
+    try:
+        created_at = _parse_created_at(event.get("created_at"))
+    except ContractGateSyncError:
+        return None
+    raw = f"{_utc_timestamp_micros(created_at)},{event_id.lower()}"
+    encoded = base64.urlsafe_b64encode(raw.encode("ascii")).decode("ascii")
+    return encoded.rstrip("=")
+
+
 def _cursor_for(state: dict, contract_id: str) -> str | None:
     return _usable_cursor(state["cursors"].get(contract_id))
 
@@ -412,10 +446,12 @@ def _sync_pages(
         for event in events:
             op.upsert(table=table, data=_event_row(event))
 
-        # next_cursor is a resume cursor: the last event on a non-empty page,
-        # or the request cursor echoed on an empty page. Save every non-null
-        # value, including on the last page. Never store null.
+        # Save next_cursor, including on the last page. When it is null and the
+        # page has events, store the last event's resume cursor instead of
+        # leaving the checkpoint unchanged. Never store null.
         next_cursor = _usable_cursor(page.get("next_cursor"))
+        if next_cursor is None and events:
+            next_cursor = _cursor_from_event(events[-1])
         if next_cursor:
             _set_cursor(state, contract_id, next_cursor)
         _checkpoint(state)
