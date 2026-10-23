@@ -110,12 +110,11 @@ def event(event_id="evt-1", payload=None, version="1.2.0", created_at="2026-05-0
     }
 
 
-def page(events, next_cursor, has_more, status=200, headers=None):
-    return FakeResponse(
-        status,
-        {"events": events, "next_cursor": next_cursor, "has_more": has_more},
-        headers=headers,
-    )
+def page(events, next_cursor, has_more, status=200, headers=None, include_next_cursor=True):
+    body = {"events": events, "has_more": has_more}
+    if include_next_cursor:
+        body["next_cursor"] = next_cursor
+    return FakeResponse(status, body, headers=headers)
 
 
 def install_session(monkeypatch, responses):
@@ -626,13 +625,21 @@ def test_multi_page_resume(monkeypatch, logs, ops):
 
 
 def test_bad_uuid_fails_and_names_the_id(monkeypatch, ops):
-    for bad in ("contract/b", "550e8400e29b41d4a716446655440000", "not-a-uuid"):
+    for bad in (
+        "contract/b",
+        "550e8400e29b41d4a716446655440000",
+        "not-a-uuid",
+        "550e8400-e29b-41d4-a716-44665544000",
+        "550e8400-e29b-41d4-a716-446655440000-extra",
+    ):
         checked = connector.configuration_check(
             {"api_key": API_KEY, "contract_ids": f"{CONTRACT_A},{bad}"}
         )
         assert checked.success is False
         assert bad in checked.failure
         assert "configuration error" in checked.failure
+        assert "DataContractGate" in checked.failure
+        assert "8-4-4-4-12" in checked.failure
         assert "UUID" in checked.failure
         assert API_KEY not in checked.failure
 
