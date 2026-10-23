@@ -7,6 +7,7 @@ and upserts one table per contract.
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import re
@@ -214,9 +215,16 @@ def update(configuration: dict, state: dict):
 
 
 def _require_contract_uuid(contract_id: str) -> str:
-    """Return the lowercase UUID, or raise ValueError naming the rejected id."""
+    """Return the lowercase UUID, or raise ValueError naming the rejected id.
+
+    Checked while validating configuration, before any DataContractGate request,
+    so a bad ``contract_ids`` entry fails setup instead of a mid-sync HTTP error.
+    """
     if _CONTRACT_UUID.fullmatch(contract_id) is None:
-        raise ValueError(f"contract id {contract_id!r} is not a UUID")
+        raise ValueError(
+            f"contract id {contract_id!r} is not a UUID. Use the contract UUID from "
+            "DataContractGate (8-4-4-4-12 hexadecimal digits)."
+        )
     return contract_id.lower()
 
 
@@ -412,10 +420,15 @@ def _sync_pages(
         for event in events:
             op.upsert(table=table, data=_event_row(event))
 
-        # next_cursor is a resume cursor: the last event on a non-empty page,
-        # or the request cursor echoed on an empty page. Save every non-null
-        # value, including on the last page. Never store null.
+        # next_cursor is the resume point for this page: the last event when
+        # the page has rows, or the request cursor echoed on an empty page.
+        # The final page may send null or omit next_cursor. Checkpoint the
+        # last event's own cursor then, so a one-page contract does not sync
+        # from the start next time. Never store null. An empty page keeps
+        # the cursor already saved.
         next_cursor = _usable_cursor(page.get("next_cursor"))
+        if not next_cursor:
+            next_cursor = _watermark_from_events(events)
         if next_cursor:
             _set_cursor(state, contract_id, next_cursor)
         _checkpoint(state)
@@ -541,6 +554,44 @@ def _error_text(response: requests.Response, api_key: str) -> str:
     if api_key:
         error = error.replace(api_key, "[redacted]")
     return error
+
+
+def _encode_passed_cursor(created_at: datetime, event_id: str) -> str:
+    """Return the DataContractGate resume cursor for one passed event.
+
+    The API cursor is base64url (no padding) of ``{created_at microseconds},{id}``.
+    The next request treats it as an exclusive lower bound.
+    """
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    else:
+        created_at = created_at.astimezone(timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = created_at - epoch
+    micros = (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+    raw = f"{micros},{event_id}".encode("ascii")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _watermark_from_events(events: list) -> str | None:
+    """Resume cursor for the last event when the page has no next_cursor.
+
+    Prefer a cursor carried on the record. Otherwise encode ``created_at`` and
+    ``id`` when ``id`` is a UUID, which is the only cursor DataContractGate will
+    accept on the next poll. Returns None when no safe watermark can be built;
+    the caller then leaves the previous high-water mark in place.
+    """
+    if not events or not isinstance(events[-1], dict):
+        return None
+    last = events[-1]
+    explicit = _usable_cursor(last.get("cursor"))
+    if explicit:
+        return explicit
+    event_id = last.get("id")
+    if not isinstance(event_id, str) or _CONTRACT_UUID.fullmatch(event_id) is None:
+        return None
+    created_at = _parse_created_at(last.get("created_at"))
+    return _encode_passed_cursor(created_at, event_id.lower())
 
 
 def _event_row(event: object) -> dict:

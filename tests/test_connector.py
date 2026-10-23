@@ -16,6 +16,12 @@ API_KEY = "cg_test_api_key_do_not_log"
 PAYLOAD_SENTINEL = "payload-secret-do-not-log"
 CONTRACT_A = "550e8400-e29b-41d4-a716-446655440000"
 CONTRACT_B = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+# Resume cursor for WATERMARK_EVENT_ID at WATERMARK_CREATED_AT.
+# base64url of "{created_at microseconds},{id}", matching DataContractGate.
+WATERMARK_EVENT_ID = "550e8400-e29b-41d4-a716-446655440000"
+WATERMARK_CREATED_AT = "2026-10-16T12:00:00.123456Z"
+WATERMARK_CURSOR = "MTc5MjE1MjAwMDEyMzQ1Niw1NTBlODQwMC1lMjliLTQxZDQtYTcxNi00NDY2NTU0NDAwMDA"
+NEWER_EVENT_ID = "22222222-2222-4222-8222-222222222222"
 
 
 class FakeResponse:
@@ -110,12 +116,11 @@ def event(event_id="evt-1", payload=None, version="1.2.0", created_at="2026-05-0
     }
 
 
-def page(events, next_cursor, has_more, status=200, headers=None):
-    return FakeResponse(
-        status,
-        {"events": events, "next_cursor": next_cursor, "has_more": has_more},
-        headers=headers,
-    )
+def page(events, next_cursor, has_more, status=200, headers=None, include_next_cursor=True):
+    body = {"events": events, "has_more": has_more}
+    if include_next_cursor:
+        body["next_cursor"] = next_cursor
+    return FakeResponse(status, body, headers=headers)
 
 
 def install_session(monkeypatch, responses):
@@ -368,6 +373,165 @@ def test_null_next_cursor_on_only_page_keeps_previously_saved_cursor(monkeypatch
     assert_no_secrets(logs, checkpoints)
 
 
+@pytest.mark.parametrize(
+    ("next_cursor", "include_next_cursor"),
+    [
+        (None, True),
+        ("", True),
+        ("   ", True),
+        (None, False),
+    ],
+)
+def test_single_page_null_next_cursor_advances_state_for_the_next_sync(
+    monkeypatch, logs, ops, next_cursor, include_next_cursor
+):
+    upserts, checkpoints = ops
+    first = event(
+        WATERMARK_EVENT_ID,
+        payload={"note": PAYLOAD_SENTINEL},
+        created_at=WATERMARK_CREATED_AT,
+    )
+    newer = event(NEWER_EVENT_ID, created_at="2026-10-16T12:00:01Z")
+    session = install_session(
+        monkeypatch,
+        [
+            page([first], next_cursor, False, include_next_cursor=include_next_cursor),
+            page([newer], None, False),
+            page([], None, False),
+        ],
+    )
+
+    connector.update(config(), {})
+
+    assert "cursor" not in session.calls[0]["params"]
+    assert len(checkpoints) == 1
+    assert checkpoints[-1]["cursors"] == {CONTRACT_A: WATERMARK_CURSOR}
+    assert [row[1]["id"] for row in upserts] == [WATERMARK_EVENT_ID]
+
+    upserts.clear()
+    connector.update(config(), checkpoints[-1])
+
+    assert session.calls[1]["params"]["cursor"] == WATERMARK_CURSOR
+    resumed = [row[1]["id"] for row in upserts]
+    assert resumed == [NEWER_EVENT_ID]
+    assert WATERMARK_EVENT_ID not in resumed
+    advanced = checkpoints[-1]["cursors"][CONTRACT_A]
+    assert advanced != WATERMARK_CURSOR
+
+    upserts.clear()
+    connector.update(config(), checkpoints[-1])
+
+    assert session.calls[2]["params"]["cursor"] == advanced
+    assert upserts == []
+    assert checkpoints[-1]["cursors"][CONTRACT_A] == advanced
+    assert_no_secrets(logs, checkpoints)
+
+
+@pytest.mark.parametrize(
+    ("next_cursor", "include_next_cursor"),
+    [
+        (None, True),
+        ("", True),
+        (None, False),
+    ],
+)
+def test_multi_page_final_null_next_cursor_advances_past_the_last_event(
+    monkeypatch, logs, ops, next_cursor, include_next_cursor
+):
+    upserts, checkpoints = ops
+    page_one_id = "11111111-1111-4111-8111-111111111111"
+    final = event(
+        WATERMARK_EVENT_ID,
+        payload={"note": PAYLOAD_SENTINEL},
+        created_at=WATERMARK_CREATED_AT,
+    )
+    session = install_session(
+        monkeypatch,
+        [
+            page([event(page_one_id, created_at="2026-10-16T11:00:00Z")], "cursor-page-1", True),
+            page([final], next_cursor, False, include_next_cursor=include_next_cursor),
+            page([], None, False),
+        ],
+    )
+
+    connector.update(config(), {})
+
+    assert len(session.calls) == 2
+    assert "cursor" not in session.calls[0]["params"]
+    assert session.calls[1]["params"]["cursor"] == "cursor-page-1"
+    assert [state["cursors"][CONTRACT_A] for state in checkpoints] == [
+        "cursor-page-1",
+        WATERMARK_CURSOR,
+    ]
+    assert [row[1]["id"] for row in upserts] == [page_one_id, WATERMARK_EVENT_ID]
+
+    upserts.clear()
+    connector.update(config(), checkpoints[-1])
+
+    assert session.calls[2]["params"]["cursor"] == WATERMARK_CURSOR
+    assert upserts == []
+    assert checkpoints[-1]["cursors"] == {CONTRACT_A: WATERMARK_CURSOR}
+    assert_no_secrets(logs, checkpoints)
+
+
+def test_multi_page_with_null_cursors_still_pages_from_each_event_watermark(
+    monkeypatch, logs, ops
+):
+    upserts, checkpoints = ops
+    page_one_id = "11111111-1111-4111-8111-111111111111"
+    page_one_at = "2026-10-16T11:00:00Z"
+    page_one_cursor = connector._encode_passed_cursor(
+        connector._parse_created_at(page_one_at),
+        page_one_id,
+    )
+    session = install_session(
+        monkeypatch,
+        [
+            page([event(page_one_id, created_at=page_one_at)], None, True),
+            page(
+                [event(WATERMARK_EVENT_ID, created_at=WATERMARK_CREATED_AT)],
+                None,
+                False,
+            ),
+        ],
+    )
+
+    connector.update(config(), {})
+
+    assert len(session.calls) == 2
+    assert "cursor" not in session.calls[0]["params"]
+    assert session.calls[1]["params"]["cursor"] == page_one_cursor
+    assert [state["cursors"][CONTRACT_A] for state in checkpoints] == [
+        page_one_cursor,
+        WATERMARK_CURSOR,
+    ]
+    assert [row[1]["id"] for row in upserts] == [page_one_id, WATERMARK_EVENT_ID]
+    assert_no_secrets(logs, checkpoints)
+
+
+def test_null_page_cursor_checkpoints_cursor_carried_on_the_last_record(monkeypatch, logs, ops):
+    upserts, checkpoints = ops
+    row = event("evt-9", payload={"note": PAYLOAD_SENTINEL})
+    row["cursor"] = "record-cursor"
+    session = install_session(
+        monkeypatch,
+        [
+            page([row], None, False),
+            page([], None, False),
+        ],
+    )
+
+    connector.update(config(), {})
+
+    assert checkpoints[-1]["cursors"][CONTRACT_A] == "record-cursor"
+    upserts.clear()
+    connector.update(config(), checkpoints[-1])
+    assert session.calls[1]["params"]["cursor"] == "record-cursor"
+    assert upserts == []
+    assert checkpoints[-1]["cursors"][CONTRACT_A] == "record-cursor"
+    assert_no_secrets(logs, checkpoints)
+
+
 def test_null_payload_is_upserted_as_null(monkeypatch, logs, ops):
     upserts, checkpoints = ops
     install_session(
@@ -543,19 +707,27 @@ def test_multi_page_resume(monkeypatch, logs, ops):
 
 
 def test_bad_uuid_fails_and_names_the_id(monkeypatch, ops):
-    bad = "contract/b"
-    checked = connector.configuration_check(
-        {"api_key": API_KEY, "contract_ids": f"{CONTRACT_A},{bad}"}
+    bad_ids = (
+        "contract/b",
+        "not-a-uuid",
+        "550e8400-e29b-41d4-a716-44665544000",
+        "550e8400-e29b-41d4-a716-446655440000-extra",
     )
-    assert bad in checked.failure
-    assert "UUID" in checked.failure
-
-    with pytest.raises(ValueError, match=re.escape(bad)):
-        connector.schema({"api_key": API_KEY, "contract_ids": bad})
-
     session = install_session(monkeypatch, [page([event("evt-1")], "cursor-1", False)])
-    with pytest.raises(ValueError, match=re.escape(bad)):
-        connector.update(config(contract_ids=bad), {})
+    for bad in bad_ids:
+        checked = connector.configuration_check(
+            {"api_key": API_KEY, "contract_ids": f" {CONTRACT_A}, {bad} "}
+        )
+        assert bad in checked.failure
+        assert "not a UUID" in checked.failure
+        assert "DataContractGate" in checked.failure
+        assert "8-4-4-4-12" in checked.failure
+        assert API_KEY not in checked.failure
+
+        with pytest.raises(ValueError, match=re.escape(bad)):
+            connector.schema({"api_key": API_KEY, "contract_ids": bad})
+        with pytest.raises(ValueError, match=re.escape(bad)):
+            connector.update(config(contract_ids=f"{CONTRACT_A},{bad}"), {})
     assert session.calls == []
 
 

@@ -89,7 +89,7 @@ The connector runtime has no extra packages. `requests` and `fivetran_connector_
 | `base_url` | no | no | API origin. Defaults to `https://api.datacontractgate.com`. Must be `https://`. `http://localhost` and `http://127.0.0.1` (any port) are allowed for local tests. |
 | `table_names` | no | no | Optional `contract_id=name` pairs, comma-separated. A name must start with a letter or underscore and use only lowercase letters, numbers, and underscores. Unlisted contracts keep `passed_<id>`. |
 
-Values are strings. `schema()` and `update()` both run `validate_configuration`. The dashboard setup form registers the same rules as a setup test named **Configuration check**.
+Values are strings. `schema()` and `update()` both run `validate_configuration`. The dashboard setup form registers the same rules as a setup test named **Configuration check**. Each `contract_ids` entry must be a UUID (`8-4-4-4-12` hexadecimal digits). An invalid id fails that check before any DataContractGate request, and the message names the id.
 
 ```json
 {
@@ -114,7 +114,9 @@ State is a JSON object of opaque cursors, one per contract:
 {"cursors": {"your-contract-id": "opaque-cursor"}}
 ```
 
-The connector checkpoints that object after every page and stops paging when `has_more` is false. `next_cursor` is a resume cursor. On a page with events it is the cursor of the last event, including when `has_more` is false. On an empty page it repeats the cursor from the request. Every non-null `next_cursor` is saved, including on the last page. A null `next_cursor` is left out of the checkpoint, so the last saved cursor stays in place.
+The connector checkpoints that object after every page and stops paging when `has_more` is false. `next_cursor` is a resume cursor. On a page with events it is the cursor of the last event, including when `has_more` is false. On an empty page it repeats the cursor from the request. Every non-null `next_cursor` is saved, including on the last page.
+
+When the final page returns `next_cursor: null` or omits it, the connector still checkpoints a watermark for the last event on that page. That watermark is the same resume cursor DataContractGate uses: base64url of `{created_at microseconds},{id}`. The next sync sends it back, including for a contract that fit in one page (1,000 events or fewer), so already-synced rows are not read again. An empty page with a null cursor leaves the last saved cursor in place. A null cursor is never stored.
 
 HTTP 410 (cursor older than the plan retention window) and HTTP 400 whose error says `invalid cursor` drop that contract's cursor and re-sync from the oldest passed record. Any other HTTP 400 fails the sync with the API's error message and leaves the saved cursor in place. HTTP 429 and 5xx responses are retried with backoff. Requests use a 10-second connect timeout and a 60-second read timeout.
 
