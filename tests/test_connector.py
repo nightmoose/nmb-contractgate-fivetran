@@ -336,6 +336,88 @@ def test_paging_checkpoints_each_page_and_keeps_non_null_final_cursor(
     assert_no_secrets(logs, checkpoints)
 
 
+# Published passed-events example: created_at 2026-10-16T12:00:00.123456Z and this id.
+EVENT_UUID = "550e8400-e29b-41d4-a716-446655440000"
+RESUME_CURSOR = "MTc5MjE1MjAwMDEyMzQ1Niw1NTBlODQwMC1lMjliLTQxZDQtYTcxNi00NDY2NTU0NDAwMDA"
+EARLIER_EVENT_UUID = "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+
+
+def test_cursor_from_last_event_matches_api_high_water_mark():
+    encoded = connector._cursor_from_event(
+        event(EVENT_UUID.upper(), created_at="2026-10-16T12:00:00.123456Z")
+    )
+    assert encoded == RESUME_CURSOR
+    earlier = connector._cursor_from_event(
+        event(EARLIER_EVENT_UUID, created_at="2026-05-01T12:00:00Z")
+    )
+    assert earlier != RESUME_CURSOR
+    assert connector._cursor_from_event(event("evt-1")) is None
+
+
+def test_final_page_null_next_cursor_saves_last_event_resume_cursor(monkeypatch, logs, ops):
+    upserts, checkpoints = ops
+    session = install_session(
+        monkeypatch,
+        [
+            page([event("evt-1", payload={"note": PAYLOAD_SENTINEL})], "cursor-1", True),
+            page(
+                [
+                    event(EARLIER_EVENT_UUID, created_at="2026-05-01T12:00:00Z"),
+                    event(EVENT_UUID, created_at="2026-10-16T12:00:00.123456Z"),
+                ],
+                None,
+                False,
+            ),
+            page([], None, False),
+        ],
+    )
+
+    connector.update(config(), {"cursors": {CONTRACT_B: "leave-b"}})
+
+    assert [row[1]["id"] for row in upserts] == ["evt-1", EARLIER_EVENT_UUID, EVENT_UUID]
+    assert checkpoints[0]["cursors"][CONTRACT_A] == "cursor-1"
+    assert checkpoints[1]["cursors"] == {CONTRACT_B: "leave-b", CONTRACT_A: RESUME_CURSOR}
+    assert all(cursor is not None for state in checkpoints for cursor in state["cursors"].values())
+
+    upserts.clear()
+    connector.update(config(), checkpoints[-1])
+
+    assert session.calls[-1]["params"]["cursor"] == RESUME_CURSOR
+    assert upserts == []
+    assert checkpoints[-1]["cursors"][CONTRACT_A] == RESUME_CURSOR
+    assert_no_secrets(logs, checkpoints)
+
+
+def test_single_page_null_next_cursor_persists_for_the_next_sync(monkeypatch, logs, ops):
+    upserts, checkpoints = ops
+    session = install_session(
+        monkeypatch,
+        [
+            page(
+                [event(EVENT_UUID, payload=None, created_at="2026-10-16T12:00:00.123456Z")],
+                None,
+                False,
+            ),
+            page([], None, False),
+        ],
+    )
+
+    connector.update(config(), {})
+
+    assert "cursor" not in session.calls[0]["params"]
+    assert checkpoints[-1]["cursors"] == {CONTRACT_A: RESUME_CURSOR}
+    assert upserts[0][1]["id"] == EVENT_UUID
+
+    upserts.clear()
+    connector.update(config(), checkpoints[-1])
+
+    assert session.calls[1]["params"]["cursor"] == RESUME_CURSOR
+    assert upserts == []
+    assert checkpoints[-1]["cursors"] == {CONTRACT_A: RESUME_CURSOR}
+    assert len(session.calls) == 2
+    assert_no_secrets(logs, checkpoints)
+
+
 def test_null_next_cursor_on_last_page_keeps_last_saved_cursor(monkeypatch, logs, ops, sleeps):
     _upserts, checkpoints = ops
     install_session(
@@ -351,6 +433,7 @@ def test_null_next_cursor_on_last_page_keeps_last_saved_cursor(monkeypatch, logs
     assert checkpoints[0]["cursors"][CONTRACT_A] == "cursor-1"
     assert checkpoints[1]["cursors"][CONTRACT_A] == "cursor-1"
     assert all(cursor is not None for state in checkpoints for cursor in state["cursors"].values())
+    assert sleeps == []
     assert_no_secrets(logs, checkpoints)
 
 
@@ -543,20 +626,23 @@ def test_multi_page_resume(monkeypatch, logs, ops):
 
 
 def test_bad_uuid_fails_and_names_the_id(monkeypatch, ops):
-    bad = "contract/b"
-    checked = connector.configuration_check(
-        {"api_key": API_KEY, "contract_ids": f"{CONTRACT_A},{bad}"}
-    )
-    assert bad in checked.failure
-    assert "UUID" in checked.failure
+    for bad in ("contract/b", "550e8400e29b41d4a716446655440000", "not-a-uuid"):
+        checked = connector.configuration_check(
+            {"api_key": API_KEY, "contract_ids": f"{CONTRACT_A},{bad}"}
+        )
+        assert checked.success is False
+        assert bad in checked.failure
+        assert "configuration error" in checked.failure
+        assert "UUID" in checked.failure
+        assert API_KEY not in checked.failure
 
-    with pytest.raises(ValueError, match=re.escape(bad)):
-        connector.schema({"api_key": API_KEY, "contract_ids": bad})
+        with pytest.raises(ValueError, match=re.escape(bad)):
+            connector.schema({"api_key": API_KEY, "contract_ids": bad})
 
-    session = install_session(monkeypatch, [page([event("evt-1")], "cursor-1", False)])
-    with pytest.raises(ValueError, match=re.escape(bad)):
-        connector.update(config(contract_ids=bad), {})
-    assert session.calls == []
+        session = install_session(monkeypatch, [page([event("evt-1")], "cursor-1", False)])
+        with pytest.raises(ValueError, match=re.escape(bad)):
+            connector.update(config(contract_ids=bad), {})
+        assert session.calls == []
 
 
 def test_free_plan_403_fails_with_paid_plan_required(monkeypatch, logs, ops):
