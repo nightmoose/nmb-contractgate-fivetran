@@ -89,7 +89,7 @@ The connector runtime has no extra packages. `requests` and `fivetran_connector_
 | `base_url` | no | no | API origin. Defaults to `https://api.datacontractgate.com`. Must be `https://`. `http://localhost` and `http://127.0.0.1` (any port) are allowed for local tests. |
 | `table_names` | no | no | Optional `contract_id=name` pairs, comma-separated. A name must start with a letter or underscore and use only lowercase letters, numbers, and underscores. Unlisted contracts keep `passed_<id>`. |
 
-Values are strings. `schema()` and `update()` both run `validate_configuration`. The dashboard setup form registers the same rules as a setup test named **Configuration check**.
+Values are strings. `schema()` and `update()` both run `validate_configuration`. The dashboard setup form registers the same rules as a setup test named **Configuration check**. Each `contract_ids` entry must be a UUID (`8-4-4-4-12` hexadecimal digits). An invalid id fails that check before any DataContractGate request, and the message names the rejected id. An empty or whitespace entry fails the same check.
 
 ```json
 {
@@ -100,7 +100,7 @@ Values are strings. `schema()` and `update()` both run `validate_configuration`.
 }
 ```
 
-Leave `table_names` empty to keep every default `passed_<id>` name. Two contracts cannot share a table, and a custom name cannot reuse another contract's default `passed_<id>` name. The configuration check reports the id or name that failed. An id in `contract_ids` that is not a UUID fails that check before any API request.
+Leave `table_names` empty to keep every default `passed_<id>` name. Two contracts cannot share a table, and a custom name cannot reuse another contract's default `passed_<id>` name. The configuration check reports the id or name that failed. An id in `contract_ids` that is not a UUID fails that check before any DataContractGate request.
 
 ## Paid plan
 
@@ -114,7 +114,7 @@ State is a JSON object of opaque cursors, one per contract:
 {"cursors": {"your-contract-id": "opaque-cursor"}}
 ```
 
-The connector checkpoints that object after every page and stops paging when `has_more` is false. `next_cursor` is a resume cursor. On a page with events it is the cursor of the last event, including when `has_more` is false. On an empty page it repeats the cursor from the request. Every non-null `next_cursor` is saved, including on the last page. When `next_cursor` is null and the page has events, the connector saves a resume cursor built from the last event (that event's `created_at` in microseconds and its id). The next sync sends that cursor, so a one-page contract or a final page that omits `next_cursor` does not start over. An empty page with a null `next_cursor` leaves the last saved cursor in place.
+The connector checkpoints that object after every page and stops paging when `has_more` is false. `next_cursor` is a resume cursor. On a page with events it is the cursor of the last event, including when `has_more` is false. On an empty page it repeats the cursor from the request. Every non-empty `next_cursor` is saved, including on the last page. When `next_cursor` is null, blank, whitespace, or omitted and the page has events, the connector saves a resume cursor built from the last event: unpadded URL-safe base64 of `{created_at microseconds},{id}`. Fractional seconds are truncated to microseconds, so a 9-digit fraction does not round into the next microsecond. The next sync sends that cursor, so a one-page contract (1,000 events or fewer) or a final page that omits `next_cursor` does not start over. If `has_more` is true and `next_cursor` is missing, the same last-event cursor is sent on the next request. An empty page with a null, blank, or omitted `next_cursor` leaves the last saved cursor in place. A null cursor is never stored.
 
 HTTP 410 (cursor older than the plan retention window) and HTTP 400 whose error says `invalid cursor` drop that contract's cursor and re-sync from the oldest passed record. Any other HTTP 400 fails the sync with the API's error message and leaves the saved cursor in place. HTTP 429 and 5xx responses are retried with backoff. Requests use a 10-second connect timeout and a 60-second read timeout.
 

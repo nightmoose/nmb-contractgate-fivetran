@@ -31,6 +31,12 @@ PAID_PLAN_REQUIRED = "paid plan required"
 _TABLE_NAME = re.compile(r"[^a-z0-9]+")
 _CUSTOM_TABLE_NAME = re.compile(r"^[a-z_][a-z0-9_]*$")
 _LOCAL_HTTP_HOSTS = frozenset({"localhost", "127.0.0.1"})
+# Fractional seconds sit between the clock time and the timezone. More than six
+# digits are truncated so a nanosecond timestamp cannot round up into the next
+# microsecond. Shorter fractions are padded, so ".123" is 123000 microseconds.
+_ISO_FRACTION = re.compile(
+    r"(?P<prefix>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})[.,](?P<fraction>\d+)"
+)
 _CONTRACT_UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
@@ -146,7 +152,10 @@ def configuration_form():
             "contract_ids",
             "Contract IDs",
             required=True,
-            description="Comma-separated contract UUIDs. Each one is synced to its own table.",
+            description=(
+                "Comma-separated DataContractGate contract UUIDs (8-4-4-4-12). "
+                "Each one is synced to its own table."
+            ),
             placeholder="550e8400-e29b-41d4-a716-446655440000",
         )
     )
@@ -219,9 +228,15 @@ def update(configuration: dict, state: dict):
 
 
 def _require_contract_uuid(contract_id: str) -> str:
-    """Return the lowercase UUID, or raise ValueError naming the rejected id."""
+    """Return the lowercase UUID, or raise ValueError naming the rejected id.
+
+    Checked while validating configuration, before any DataContractGate request.
+    """
     if _CONTRACT_UUID.fullmatch(contract_id) is None:
-        raise ValueError(f"contract id {contract_id!r} is not a UUID")
+        raise ValueError(
+            f"contract id {contract_id!r} is not a UUID. Use the contract UUID from "
+            "DataContractGate (8-4-4-4-12 hexadecimal digits)."
+        )
     return contract_id.lower()
 
 
@@ -446,9 +461,10 @@ def _sync_pages(
         for event in events:
             op.upsert(table=table, data=_event_row(event))
 
-        # Save next_cursor, including on the last page. When it is null and the
-        # page has events, store the last event's resume cursor instead of
-        # leaving the checkpoint unchanged. Never store null.
+        # Save a non-empty next_cursor, including on the last page. Null, blank,
+        # whitespace, and a missing next_cursor fall back to the last event's
+        # resume cursor when the page has events. Never store null. An empty
+        # page keeps the cursor already saved.
         next_cursor = _usable_cursor(page.get("next_cursor"))
         if next_cursor is None and events:
             next_cursor = _cursor_from_event(events[-1])
@@ -596,15 +612,34 @@ def _event_row(event: object) -> dict:
     }
 
 
+def _normalize_iso_timestamp(text: str) -> str:
+    """Make an ISO-8601 timestamp safe to parse as microseconds.
+
+    ``Z`` and ``z`` become ``+00:00``. More than six fractional digits are
+    truncated, not rounded. Fewer than six are padded on the right, so
+    ``.123`` is 123000 microseconds.
+    """
+    normalized = text.strip()
+    if normalized.endswith(("Z", "z")):
+        normalized = f"{normalized[:-1]}+00:00"
+
+    def _fraction(match: re.Match[str]) -> str:
+        fraction = match.group("fraction")
+        if len(fraction) > 6:
+            fraction = fraction[:6]
+        elif len(fraction) < 6:
+            fraction = fraction.ljust(6, "0")
+        return f"{match.group('prefix')}.{fraction}"
+
+    return _ISO_FRACTION.sub(_fraction, normalized, count=1)
+
+
 def _parse_created_at(value: object) -> datetime:
     if isinstance(value, datetime):
         parsed = value
     elif isinstance(value, str):
-        text = value.strip()
-        if text.endswith("Z"):
-            text = f"{text[:-1]}+00:00"
         try:
-            parsed = datetime.fromisoformat(text)
+            parsed = datetime.fromisoformat(_normalize_iso_timestamp(value))
         except ValueError as exc:
             raise ContractGateSyncError("passed event created_at is not a UTC timestamp") from exc
     else:
